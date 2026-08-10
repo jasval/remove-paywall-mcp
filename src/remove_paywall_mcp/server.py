@@ -9,12 +9,12 @@ import httpx
 from mcp.server import MCPServer
 
 from . import domain_store
-from .archives import ARCHIVE_SOURCES, search_all
+from .archives import ARCHIVE_SOURCES, _has_paywall_content, search_all
 from .extractors import extract_body
 
 server = MCPServer(
     name="remove-paywall",
-    version="0.1.0",
+    version="1.0.0",
     description="MCP server that removes article paywalls via internet archives",
 )
 
@@ -29,21 +29,28 @@ def _domain(url: str) -> str:
 
 
 def _title_from_html(html: str) -> str:
-    m = _re.search(r"<title[^>]*>([^<]+)</title>", html, _re.IGNORECASE)
-    return m.group(1).strip() if m else "(no title)"
+    m = _re.search(r"<title[^>]*>([^<]+)</title>", html, _re.DOTALL | _re.IGNORECASE)
+    if m:
+        import html as _h
+        return _h.unescape(m.group(1).strip())
+    return "(no title)"
 
 
 # ---------------------------------------------------------------------------
-# Tool functions
+# Tools
 # ---------------------------------------------------------------------------
 
 
+@server.tool()
 async def remove_paywall(url: str) -> str:
     """Remove a paywall from an article URL by searching internet archives.
 
-    Archives are tried in order of historical success rate for the domain,
-    falling back to: Wayback Machine, archive.is, Google Cache, removepaywall.com.
-    Returns the extracted article text with title and snapshot info.
+    Archives are tried in parallel using historical success rates to
+    prioritize the best one for each domain. Sources: Wayback Machine
+    (CDX API with dedup + newest-first), archive.is mirrors, and
+    Memento Time Travel (aggregates ~20 archives).
+
+    Returns extracted article text with title and snapshot info.
     """
     domain = _domain(url)
 
@@ -62,6 +69,22 @@ async def remove_paywall(url: str) -> str:
         return f"Could not remove paywall. All archives exhausted:\n{failures}"
 
     text = extract_body(result.html) if result.html else ""
+    if not text.strip():
+        return f"Extracted text was empty from {result.source} ({result.snapshot_url})"
+
+    if _has_paywall_content(text):
+        await domain_store.log_attempt(domain, result.source, False)
+        remaining = [s for s in archive_order if s not in {r.source for r in all_results if not r.success}]
+        if remaining:
+            retry_result, retry_all = await search_all(url, archive_order=remaining)
+            for r in retry_all:
+                await domain_store.log_attempt(domain, r.source, r.success)
+            if retry_result.success:
+                retry_text = extract_body(retry_result.html) if retry_result.html else ""
+                if retry_text.strip() and not _has_paywall_content(retry_text):
+                    result = retry_result
+                    text = retry_text
+
     title = _title_from_html(result.html) if result.html else ""
     snapshot = result.snapshot_url or "(no snapshot URL)"
 
@@ -73,14 +96,15 @@ async def remove_paywall(url: str) -> str:
     )
 
 
+@server.tool()
 async def search_archives(url: str) -> str:
     """Search all archive sources for snapshots of a URL.
 
-    Returns a list of available snapshot URLs from each archive source
-    (Wayback Machine, archive.is, Google Cache, removepaywall.com proxy).
+    Returns a list of available snapshot URLs from each archive source:
+    Wayback Machine, archive.is (multiple mirrors), and Memento Time Travel.
     Does not extract content — use remove_paywall for full article retrieval.
     """
-    archive_order = ["wayback", "archive_is", "google_cache"]
+    archive_order = ["wayback", "archive_is", "memento"]
 
     async with httpx.AsyncClient(headers={"User-Agent": UA}, follow_redirects=True) as client:
         lines: list[str] = []
@@ -97,10 +121,11 @@ async def search_archives(url: str) -> str:
     return "Archive snapshots:\n" + "\n".join(lines)
 
 
+@server.tool()
 async def get_from_archive(url: str, source: str) -> str:
     """Fetch an archived version of a URL from a specific source.
 
-    source must be one of: wayback, archive_is, google_cache, removepaywall_com.
+    source must be one of: wayback, archive_is, memento.
     Returns the extracted article text.
     """
     handler = ARCHIVE_SOURCES.get(source)
@@ -125,6 +150,7 @@ async def get_from_archive(url: str, source: str) -> str:
     )
 
 
+@server.tool()
 async def domain_info(domain: str) -> str:
     """Look up stored knowledge about a paywall domain.
 
@@ -138,8 +164,8 @@ async def domain_info(domain: str) -> str:
     if dom is None:
         return f"Domain '{domain_clean}' is not in the knowledge base. Use add_domain to register it."
 
-    stats = await domain_store.get_attempt_stats(domain)
-    best = await domain_store.get_best_archives(domain)
+    stats = await domain_store.get_attempt_stats(domain_clean)
+    best = await domain_store.get_best_archives(domain_clean)
 
     lines = [
         f"## Domain: {domain_clean}",
@@ -158,11 +184,12 @@ async def domain_info(domain: str) -> str:
     else:
         lines.append("  (no attempts yet)")
 
-    lines.append(f"\n### Best archive order\n  {' → '.join(best)}")
+    lines.append(f"\n### Best archive order\n  {' ' + chr(8594) + ' '.join(best)}")
 
     return "\n".join(lines)
 
 
+@server.tool()
 async def add_domain(domain: str, has_paywall: bool, notes: str | None = None) -> str:
     """Register a domain in the paywall knowledge base.
 
@@ -182,27 +209,19 @@ async def add_domain(domain: str, has_paywall: bool, notes: str | None = None) -
 
 
 async def _fetch_live(url: str) -> str:
-    async with httpx.AsyncClient(headers={"User-Agent": UA}, follow_redirects=True, timeout=30) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        text = extract_body(resp.text)
-        title = _title_from_html(resp.text)
-        return (
-            f"# {title}\n\n"
-            f"**Source:** live (domain marked as non-paywalled)\n\n"
-            f"{text}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Register tools
-# ---------------------------------------------------------------------------
-
-server._tool_manager.add_tool(remove_paywall)
-server._tool_manager.add_tool(search_archives)
-server._tool_manager.add_tool(get_from_archive)
-server._tool_manager.add_tool(domain_info)
-server._tool_manager.add_tool(add_domain)
+    try:
+        async with httpx.AsyncClient(headers={"User-Agent": UA}, follow_redirects=True, timeout=30) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            text = extract_body(resp.text)
+            title = _title_from_html(resp.text)
+            return (
+                f"# {title}\n\n"
+                f"**Source:** live (domain marked as non-paywalled)\n\n"
+                f"{text}"
+            )
+    except Exception as exc:
+        return f"Failed to fetch live page: {exc}"
 
 
 # ---------------------------------------------------------------------------

@@ -1,21 +1,28 @@
 from __future__ import annotations
 
-import re
+import asyncio
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 import httpx
 
 TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 CDX_BASE = "https://web.archive.org/cdx/search/cdx"
 ARCHIVE_VIEW = "https://web.archive.org/web/{timestamp}id_/{url}"
-ARCHIVE_IS_BASE = "https://archive.is"
-GOOGLE_CACHE = "https://webcache.googleusercontent.com/search?q=cache:{url}"
+ARCHIVE_IS_MIRRORS = ["https://archive.is", "https://archive.ph", "https://archive.md"]
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "gclid", "gclsrc", "dclid", "msclkid", "twclid",
+    "ref", "ref_src", "source", "mc_cid", "mc_eid",
+}
 
 GATEWAY_MARKERS = [
     "Welcome to nginx",
@@ -32,14 +39,64 @@ GATEWAY_MARKERS = [
     "google.com/webhp",
     "<title>cache:",
     "google.com/search</title>",
-    "Please Don't Scroll Past This",
+    "Please Don",
     "<title>Wayback Machine</title>",
+    "Attention Required! | Cloudflare",
+    "Sorry, you have been blocked",
+    "/cdn-cgi/challenge-platform",
+    "Pardon our interruption",
+    "captcha-delivery",
+    "Access denied</title>",
+    "unusual traffic",
+    "cannot be crawled or displayed due to robots.txt",
+    "The Wayback Machine has not archived that URL",
+]
+
+PAYWALL_MARKERS = [
+    "subscribe to continue reading",
+    "already a subscriber",
+    "create an account to",
+    "verify access",
+    "this article is for subscribers",
+    "sign in to continue",
+    "you've read all of your free articles",
+    "support quality journalism",
+    "create a free account to continue",
+    "start your free trial",
+    "unlock this article",
+    "metered paywall",
+    "login to continue reading",
+    "please log in",
+    "register to read",
+    "get unlimited access",
+    "purchase a subscription",
+    "choose a subscription",
+    "become a subscriber",
+    "thank you for your patience while we verify",
+    "we hope you",
+    "enjoying our journalism",
+    "subscribe for",
+    "view subscription options",
 ]
 
 
+def normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.query:
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        clean = {k: v for k, v in qs.items() if k.lower() not in _TRACKING_PARAMS}
+        parsed = parsed._replace(query=urlencode(clean, doseq=True) if clean else "")
+    return urlunparse(parsed._replace(fragment=""))
+
+
 def _is_gateway_page(html: str) -> bool:
-    head = html[:2000].lower()
-    return any(m.lower() in head for m in GATEWAY_MARKERS)
+    body = html.lower()
+    return any(m.lower() in body for m in GATEWAY_MARKERS)
+
+
+def _has_paywall_content(text: str) -> bool:
+    head = text[:2000].lower()
+    return any(m.lower() in head for m in PAYWALL_MARKERS)
 
 
 @dataclass
@@ -59,8 +116,15 @@ def _make_client() -> httpx.AsyncClient:
     )
 
 
-def _valid_page(resp: httpx.Response) -> bool:
-    return resp.status_code == 200 and len(resp.text) > 500 and not _is_gateway_page(resp.text)
+def _has_sufficient_content(resp: httpx.Response) -> bool:
+    if resp.status_code != 200:
+        return False
+    size = len(resp.content)
+    if size < 500:
+        return False
+    if size > MAX_RESPONSE_BYTES:
+        return False
+    return not _is_gateway_page(resp.text)
 
 
 async def wayback(url: str, client: httpx.AsyncClient | None = None) -> ArchiveResult:
@@ -68,35 +132,39 @@ async def wayback(url: str, client: httpx.AsyncClient | None = None) -> ArchiveR
     if own_client:
         client = _make_client()
     try:
+        normalized = normalize_url(url)
         cdx_url = (
-            f"{CDX_BASE}?url={quote(url, safe='')}"
-            f"&output=json&limit=5&fl=timestamp,original,statuscode"
-            f"&filter=statuscode:200"
+            f"{CDX_BASE}?url={quote(normalized, safe='')}"
+            f"&output=json&limit=-5&fl=timestamp,original,statuscode"
+            f"&filter=statuscode:200&filter=mimetype:text/html&collapse=digest"
         )
         resp = await client.get(cdx_url)
         if resp.status_code != 200:
             return ArchiveResult(False, "wayback", None, None, f"CDX API error: {resp.status_code}")
         try:
             rows = resp.json()
-        except Exception:
-            return ArchiveResult(False, "wayback", None, None, "CDX response not valid JSON")
+        except Exception as exc:
+            return ArchiveResult(False, "wayback", None, None, f"CDX response not valid JSON: {exc}")
 
         if not rows or len(rows) < 2:
             return ArchiveResult(False, "wayback", None, None, "No snapshots found in Wayback Machine")
 
+        last_error = None
         for row in rows[1:]:
             timestamp, orig_url, _status = row
             view_url = ARCHIVE_VIEW.format(timestamp=timestamp, url=quote(orig_url, safe=""))
             try:
                 view_resp = await client.get(view_url)
-                if _valid_page(view_resp):
+                if _has_sufficient_content(view_resp):
                     return ArchiveResult(True, "wayback", view_resp.text, view_url, None)
-            except Exception:
+            except Exception as exc:
+                last_error = exc
                 continue
 
-        return ArchiveResult(False, "wayback", None, None, "Archived snapshots are empty or unreachable")
-    except Exception as e:
-        return ArchiveResult(False, "wayback", None, None, str(e))
+        detail = f" (last error: {last_error})" if last_error else ""
+        return ArchiveResult(False, "wayback", None, None, f"Archived snapshots are empty or unreachable{detail}")
+    except Exception as exc:
+        return ArchiveResult(False, "wayback", None, None, str(exc))
     finally:
         if own_client:
             await client.aclose()
@@ -107,61 +175,57 @@ async def archive_is(url: str, client: httpx.AsyncClient | None = None) -> Archi
     if own_client:
         client = _make_client()
     try:
+        normalized = normalize_url(url)
         for variant in ("newest", "oldest"):
-            lookup_url = f"{ARCHIVE_IS_BASE}/{variant}/{quote(url, safe='')}"
-            try:
-                resp = await client.get(lookup_url)
-                if _valid_page(resp):
-                    return ArchiveResult(True, "archive_is", resp.text, lookup_url, None)
-            except Exception:
-                continue
+            for mirror in ARCHIVE_IS_MIRRORS:
+                lookup_url = f"{mirror}/{variant}/{quote(normalized, safe='')}"
+                try:
+                    resp = await client.get(lookup_url)
+                    if _has_sufficient_content(resp):
+                        return ArchiveResult(True, "archive_is", resp.text, str(resp.url), None)
+                except Exception:
+                    continue
         return ArchiveResult(False, "archive_is", None, None, "No archive.is snapshot found")
-    except Exception as e:
-        return ArchiveResult(False, "archive_is", None, None, str(e))
+    except Exception as exc:
+        return ArchiveResult(False, "archive_is", None, None, str(exc))
     finally:
         if own_client:
             await client.aclose()
 
 
-async def google_cache(url: str, client: httpx.AsyncClient | None = None) -> ArchiveResult:
+async def memento(url: str, client: httpx.AsyncClient | None = None) -> ArchiveResult:
     own_client = client is None
     if own_client:
         client = _make_client()
     try:
-        cache_url = GOOGLE_CACHE.format(url=quote(url, safe=""))
-        resp = await client.get(cache_url)
-        if _valid_page(resp):
-            return ArchiveResult(True, "google_cache", resp.text, cache_url, None)
-        return ArchiveResult(
-            False, "google_cache", None, None, f"Google cache not available (HTTP {resp.status_code})"
+        api_url = f"https://timetravel.mementoweb.org/api/json/{quote(normalize_url(url), safe='')}"
+        resp = await client.get(api_url)
+        if resp.status_code != 200:
+            return ArchiveResult(False, "memento", None, None, f"Memento API error: {resp.status_code}")
+        try:
+            data = resp.json()
+        except Exception as exc:
+            return ArchiveResult(False, "memento", None, None, f"Memento response not valid JSON: {exc}")
+
+        mementos = data.get("mementos", {})
+        uris = sorted(
+            [(info.get("uri", ""), info.get("datetime", "")) for info in mementos.get("list", [])],
+            key=lambda x: x[1],
+            reverse=True,
         )
-    except Exception as e:
-        return ArchiveResult(False, "google_cache", None, None, str(e))
-    finally:
-        if own_client:
-            await client.aclose()
+        if not uris:
+            return ArchiveResult(False, "memento", None, None, "No mementos found")
 
-
-async def removepaywall_com(url: str, client: httpx.AsyncClient | None = None) -> ArchiveResult:
-    own_client = client is None
-    if own_client:
-        client = _make_client()
-    try:
-        tries = [
-            f"https://archive.is/newest/{quote(url, safe='')}",
-            f"https://archive.is/oldest/{quote(url, safe='')}",
-            f"https://web.archive.org/web/*/{quote(url, safe='')}",
-        ]
-        for try_url in tries:
+        for uri, _dt in uris[:3]:
             try:
-                resp = await client.get(try_url)
-                if _valid_page(resp):
-                    return ArchiveResult(True, "removepaywall_com", resp.text, try_url, None)
+                arc_resp = await client.get(uri)
+                if _has_sufficient_content(arc_resp):
+                    return ArchiveResult(True, "memento", arc_resp.text, uri, None)
             except Exception:
                 continue
-        return ArchiveResult(False, "removepaywall_com", None, None, "No archive snapshot found via removepaywall.com")
-    except Exception as e:
-        return ArchiveResult(False, "removepaywall_com", None, None, str(e))
+        return ArchiveResult(False, "memento", None, None, "Memento snapshots were empty or unreachable")
+    except Exception as exc:
+        return ArchiveResult(False, "memento", None, None, str(exc))
     finally:
         if own_client:
             await client.aclose()
@@ -170,11 +234,10 @@ async def removepaywall_com(url: str, client: httpx.AsyncClient | None = None) -
 ARCHIVE_SOURCES: dict[str, object] = {
     "wayback": wayback,
     "archive_is": archive_is,
-    "google_cache": google_cache,
-    "removepaywall_com": removepaywall_com,
+    "memento": memento,
 }
 
-DEFAULT_ARCHIVE_ORDER: list[str] = ["wayback", "archive_is", "google_cache"]
+DEFAULT_ARCHIVE_ORDER: list[str] = ["wayback", "archive_is", "memento"]
 
 
 async def search_all(
@@ -183,21 +246,34 @@ async def search_all(
     if archive_order is None:
         archive_order = list(DEFAULT_ARCHIVE_ORDER)
 
-    client = _make_client()
-    try:
-        all_results: list[ArchiveResult] = []
-        for source in archive_order:
-            handler = ARCHIVE_SOURCES.get(source)
-            if handler is None:
-                continue
+    async def _try(source: str) -> ArchiveResult:
+        handler = ARCHIVE_SOURCES.get(source)
+        if handler is None:
+            return ArchiveResult(False, source, None, None, f"Unknown source: {source}")
+        async with _make_client() as c:
             try:
-                result = await handler(url, client=client)  # type: ignore[arg-type]
+                return await handler(url, client=c)  # type: ignore[arg-type]
             except Exception as exc:
-                result = ArchiveResult(False, source, None, None, str(exc))
-            all_results.append(result)
-            if result.success:
-                return result, all_results
+                return ArchiveResult(False, source, None, None, str(exc))
 
-        return ArchiveResult(False, "none", None, None, "All archive sources exhausted"), all_results
-    finally:
-        await client.aclose()
+    tasks: dict[str, asyncio.Task[ArchiveResult]] = {}
+    for source in archive_order:
+        tasks[source] = asyncio.create_task(_try(source))
+
+    pending = set(tasks.values())
+    all_results: list[ArchiveResult] = []
+    first_success: ArchiveResult | None = None
+
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            result = task.result()
+            all_results.append(result)
+            if result.success and first_success is None:
+                first_success = result
+
+    if first_success is not None:
+        return first_success, sorted(all_results, key=lambda r: archive_order.index(r.source))
+    return ArchiveResult(False, "none", None, None, "All archive sources exhausted"), sorted(
+        all_results, key=lambda r: archive_order.index(r.source)
+    )

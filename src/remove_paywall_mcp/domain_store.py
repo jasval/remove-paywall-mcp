@@ -6,7 +6,7 @@ import aiosqlite
 DB_DIR = os.environ.get("MCP_DB_DIR", os.path.expanduser("~/.remove-paywall-mcp"))
 DB_PATH = os.path.join(DB_DIR, "domains.db")
 
-DEFAULT_ARCHIVES = ["wayback", "archive_is", "google_cache"]
+DEFAULT_ARCHIVES = ["wayback", "archive_is", "memento"]
 
 SEED_DOMAINS = [
     ("nytimes.com", "Soft paywall on most articles"),
@@ -39,6 +39,9 @@ SEED_DOMAINS = [
     ("thecut.com", "Soft paywall"),
     ("grubstreet.com", "Soft paywall"),
     ("curbed.com", "Soft paywall"),
+    ("fortune.com", "Soft paywall"),
+    ("theinformation.com", "Hard paywall"),
+    ("statnews.com", "Soft paywall"),
 ]
 
 
@@ -64,6 +67,9 @@ async def _ensure_db() -> aiosqlite.Connection:
             success      INTEGER NOT NULL,
             attempted_at TEXT DEFAULT (datetime('now'))
         )
+    """)
+    await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_attempts_domain ON archive_attempts(domain)
     """)
     await db.commit()
     return db
@@ -114,7 +120,7 @@ async def add_domain(domain: str, has_paywall: bool, notes: str | None = None) -
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(domain) DO UPDATE SET
                has_paywall = excluded.has_paywall,
-               notes = excluded.notes,
+               notes = COALESCE(excluded.notes, domains.notes),
                updated_at = excluded.updated_at""",
             (domain, 1 if has_paywall else 0, notes, now, now),
         )
@@ -141,7 +147,8 @@ async def get_best_archives(domain: str) -> list[str]:
     try:
         async with db.execute(
             "SELECT archive, SUM(success) as wins, COUNT(*) as total "
-            "FROM archive_attempts WHERE domain = ? GROUP BY archive ORDER BY wins DESC, total DESC",
+            "FROM archive_attempts WHERE domain = ? GROUP BY archive "
+            "ORDER BY (wins + 1.0) / (total + 2.0) DESC",
             (domain,),
         ) as cursor:
             rows = await cursor.fetchall()
@@ -163,7 +170,8 @@ async def get_attempt_stats(domain: str) -> list[dict]:
     try:
         async with db.execute(
             "SELECT archive, SUM(success) as successes, COUNT(*) as total "
-            "FROM archive_attempts WHERE domain = ? GROUP BY archive",
+            "FROM archive_attempts WHERE domain = ? GROUP BY archive "
+            "ORDER BY (successes + 1.0) / (total + 2.0) DESC",
             (domain,),
         ) as cursor:
             return [dict(r) for r in await cursor.fetchall()]

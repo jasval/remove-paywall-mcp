@@ -42,4 +42,5 @@ remove-paywall-mcp = "remove_paywall_mcp.server:main"
 
 [tool.ruff.lint.per-file-ignores]
 "src/remove_paywall_mcp/archives.py" = ["BLE001", "S112", "S110"]
+"src/remove_paywall_mcp/server.py" = ["BLE001"]
 "src/remove_paywall_mcp/extractors.py" = ["BLE001"]

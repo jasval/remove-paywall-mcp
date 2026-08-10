@@ -100,7 +100,7 @@ Fetch from a specific archive source.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `url` | string | The article URL |
-| `source` | string | `wayback`, `archive_is`, `google_cache`, or `removepaywall_com` |
+| `source` | string | `wayback`, `archive_is`, or `memento` |
 
 ### `domain_info`
 
@@ -137,10 +137,9 @@ Seeded with 30 well-known paywalled domains (NYT, WSJ, Bloomberg, Medium, etc.),
 
 | Source | Priority | Notes |
 |--------|----------|-------|
-| Wayback Machine | 1 | Most comprehensive, CDX API for snapshot discovery |
-| archive.is | 2 | Often has recent snapshots but can serve gateway pages |
-| Google Cache | 3 | Lightweight, sometimes the only option |
-| removepaywall.com | 4 | Fallback proxy, scrapes archive links from search results |
+| Wayback Machine | 1 | CDX API, newest-first with dedup and HTML-only filtering |
+| archive.is mirrors | 2 | Tries newest/oldest across archive.is, archive.ph, archive.md |
+| Memento Time Travel | 3 | Aggregates ~20 archive APIs including national libraries |
 
 Priority is dynamically re-ranked per domain based on historical success rates recorded in the knowledge base.
 
@@ -152,7 +151,7 @@ MCP client (Claude/OpenCode/LiteLLM)
        ▼
 ┌─────────────────┐
 │    server.py     │  MCPServer with 5 tools
-│    (FastMCP)     │
+│  (.tool decorator)│
 └────────┬────────┘
          │
     ┌────┴────┐
@@ -164,9 +163,7 @@ MCP client (Claude/OpenCode/LiteLLM)
 │ wayback│ │readability│
 │ archive│ │Beautiful  │
 │ .is    │ │Soup       │
-│ google │ │           │
-│ remove │ │           │
-│ paywall│ │           │
+│memento │ │           │
 └───┬────┘ └──────────┘
     │
     ▼
@@ -179,7 +176,8 @@ MCP client (Claude/OpenCode/LiteLLM)
 │ have paywalls│
 │ and which    │
 │ archives work│
-│ best         │
+│ best (Laplace│
+│ smoothed)    │
 └──────────────┘
 ```
 
