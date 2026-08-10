@@ -204,6 +204,80 @@ async def add_domain(domain: str, has_paywall: bool, notes: str | None = None) -
 
 
 # ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+
+@server.prompt()
+async def remove_paywall_prompt(url: str) -> list[dict]:
+    """Use this prompt when you encounter a URL blocked by a paywall or login wall.
+
+    The remove_paywall tool will search internet archives (Wayback Machine,
+    archive.is mirrors, and Wayback Availability API) for an archived copy
+    of the article that bypasses the paywall. Non-paywalled domains are
+    fetched live.
+
+    Archive sources are tried in parallel, with order optimized per-domain
+    based on historical success rates.
+    """
+    return [
+        {
+            "role": "user",
+            "content": (
+                f"I need to bypass the paywall on this article: {url}\n\n"
+                "Use the remove_paywall tool to find an archived version. "
+                "If no archive has it, try search_archives to see what's available. "
+                "Also check domain_info for known paywall patterns on this site."
+            ),
+        }
+    ]
+
+
+@server.prompt()
+async def bypass_paywall(url: str) -> list[dict]:
+    """Short alias for remove_paywall_prompt. Use when you hit a paywall, login wall,
+    or subscriber-only article — this prompt instructs the assistant to search archives
+    for a readable copy.
+    """
+    return [
+        {
+            "role": "user",
+            "content": (
+                f"This article is behind a paywall: {url}\n\n"
+                "Call remove_paywall to get the full text from internet archives."
+            ),
+        }
+    ]
+
+
+@server.prompt()
+async def handle_paywalls() -> list[dict]:
+    """System prompt fragment. Instructs the assistant to automatically use the
+    remove_paywall tool whenever it encounters a URL that is behind a paywall,
+    login wall, metered paywall, or subscriber-only content.
+
+    Load this as part of the assistant's system instructions for automatic
+    paywall bypass.
+    """
+    return [
+        {
+            "role": "user",
+            "content": (
+                "When you encounter a URL that is behind a paywall, login wall, "
+                "metered paywall, or subscriber-only content, call the "
+                "remove_paywall tool with that URL to retrieve the full article "
+                "from internet archives. "
+                "If remove_paywall fails, try search_archives to see what snapshots "
+                "are available. "
+                "Use domain_info for known paywall patterns on specific sites. "
+                "Non-paywalled domains in the knowledge base are fetched directly "
+                "without archive search."
+            ),
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
