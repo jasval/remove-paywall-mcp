@@ -6,7 +6,7 @@ import aiosqlite
 DB_DIR = os.environ.get("MCP_DB_DIR", os.path.expanduser("~/.remove-paywall-mcp"))
 DB_PATH = os.path.join(DB_DIR, "domains.db")
 
-DEFAULT_ARCHIVES = ["wayback", "archive_is", "wayback_available"]
+DEFAULT_ARCHIVES = ["googlebot", "12ft", "iitty", "wayback", "archive_is", "wayback_available"]
 
 SEED_DOMAINS = [
     ("nytimes.com", "Soft paywall on most articles"),

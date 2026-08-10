@@ -6,7 +6,11 @@ MCP server that removes article paywalls by searching internet archives. Give it
 
 1. You give it a paywalled article URL
 2. Tracking params are stripped and the URL is normalized
-3. It searches internet archives in parallel (Wayback Machine CDX API, archive.is mirrors, Wayback Availability API) for an archived copy — archives don't have paywalls because they were crawled without login gates
+3. It tries multiple approaches in parallel:
+   - Direct fetch with Googlebot user-agent (FT, WSJ, and many others serve full content to crawlers)
+   - 12ft.io proxy for hard paywalls
+   - iitty textise for plain-text rendering
+   - Wayback Machine CDX API, archive.ph/is mirrors, and Wayback Availability API
 4. It extracts the article body with [readability-lxml](https://github.com/buriy/python-readability), stripping navigation, ads, and sidebar cruft
 5. Post-extraction check: if the result still contains paywall text (e.g., the snapshot captured the paywall itself), it retries with the next archive
 6. It returns clean text with the title and snapshot URL
@@ -102,7 +106,7 @@ Fetch from a specific archive source.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `url` | string | The article URL |
-| `source` | string | `wayback`, `archive_is`, or `wayback_available` |
+| `source` | string | `googlebot`, `12ft`, `iitty`, `wayback`, `archive_is`, or `wayback_available` |
 
 ### `domain_info`
 
@@ -148,7 +152,7 @@ System prompt fragment. No arguments — returns instructions for the assistant 
 
 ## Domain knowledge base
 
-Seeded with 30 well-known paywalled domains (NYT, WSJ, Bloomberg, Medium, etc.), stored in SQLite at `~/.remove-paywall-mcp/domains.db`. Tracks every archive success/failure per domain and re-ranks archive search order automatically — domains where archive.is consistently fails won't waste time on it.
+Seeded with 33 well-known paywalled domains (NYT, WSJ, Bloomberg, Medium, etc.), stored in SQLite at `~/.remove-paywall-mcp/domains.db`. Tracks every archive success/failure per domain and re-ranks archive search order automatically — domains where archive.is consistently fails won't waste time on it.
 
 ### Env vars
 
@@ -163,9 +167,12 @@ Seeded with 30 well-known paywalled domains (NYT, WSJ, Bloomberg, Medium, etc.),
 
 | Source | Priority | Notes |
 |--------|----------|-------|
-| Wayback Machine | 1 | CDX API, newest-first (`limit=-5`), dedup via `collapse=digest`, HTML-only |
-| archive.is mirrors | 2 | Tries newest/oldest across archive.is, archive.today, archive.ph, archive.md |
-| Wayback Availability | 3 | `archive.org/wayback/available` — single closest snapshot as fast fallback |
+| Googlebot direct | 1 | Fetches directly with `Googlebot/2.1` UA — many sites (FT, WSJ) serve full content to crawlers |
+| 12ft.io | 2 | Proxy at `12ft.io/proxy?q=<url>` — reliable for most hard paywalls |
+| iitty | 3 | `textise.iitty.com` — plain-text rendering, works well on FT |
+| Wayback Machine | 4 | CDX API, newest-first (`limit=-5`), dedup via `collapse=digest`, HTML-only |
+| archive.is/ph mirrors | 5 | Tries newest/oldest across archive.ph, archive.is, archive.today, archive.md |
+| Wayback Availability | 6 | `archive.org/wayback/available` — single closest snapshot as fast fallback |
 
 Priority is dynamically re-ranked per domain based on historical success rates recorded in the knowledge base.
 
@@ -186,9 +193,12 @@ MCP client (Claude/OpenCode/LiteLLM)
 │archives│ │ extractors│
 │  .py   │ │   .py     │
 │        │ │           │
-│ wayback│ │readability│
-│ archive│ │Beautiful  │
-│ .is    │ │Soup       │
+│googlebot│ │readability│
+│ 12ft   │ │Beautiful  │
+│ iitty  │ │Soup       │
+│ wayback│ │           │
+│ archive│ │           │
+│ .is/ph │ │           │
 │ wayback│ │           │
 │ avail  │ │           │
 └───┬────┘ └──────────┘

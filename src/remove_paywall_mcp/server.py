@@ -14,7 +14,7 @@ from .extractors import extract_body
 
 server = MCPServer(
     name="remove-paywall",
-    version="1.0.0",
+    version="1.4.0",
     description="MCP server that removes article paywalls via internet archives",
 )
 
@@ -45,10 +45,11 @@ def _title_from_html(html: str) -> str:
 async def remove_paywall(url: str) -> str:
     """Remove a paywall from an article URL by searching internet archives.
 
-    Archives are tried in parallel using historical success rates to
-    prioritize the best one for each domain. Sources: Wayback Machine
-    (CDX API with dedup + newest-first), archive.is mirrors, and
-    Memento Time Travel (aggregates ~20 archives).
+    First tries a direct fetch with Googlebot user-agent (many sites serve
+    full content to crawlers), then 12ft.io proxy, iitty textise, Wayback
+    Machine (CDX API with dedup + newest-first), archive.is/ph mirrors,
+    and Wayback Availability API. Archives are tried in parallel using
+    historical success rates to prioritize the best one for each domain.
 
     Returns extracted article text with title and snapshot info.
     """
@@ -101,10 +102,11 @@ async def search_archives(url: str) -> str:
     """Search all archive sources for snapshots of a URL.
 
     Returns a list of available snapshot URLs from each archive source:
-    Wayback Machine, archive.is (multiple mirrors), and Memento Time Travel.
+    Googlebot direct fetch, 12ft.io proxy, iitty textise, Wayback Machine,
+    archive.is/ph mirrors, and Wayback Availability API.
     Does not extract content — use remove_paywall for full article retrieval.
     """
-    archive_order = ["wayback", "archive_is", "wayback_available"]
+    archive_order = ["googlebot", "12ft", "iitty", "wayback", "archive_is", "wayback_available"]
 
     async with httpx.AsyncClient(headers={"User-Agent": UA}, follow_redirects=True) as client:
         lines: list[str] = []
@@ -125,7 +127,8 @@ async def search_archives(url: str) -> str:
 async def get_from_archive(url: str, source: str) -> str:
     """Fetch an archived version of a URL from a specific source.
 
-    source must be one of: wayback, archive_is, wayback_available.
+    source must be one of: googlebot, 12ft, iitty, wayback, archive_is,
+    wayback_available.
     Returns the extracted article text.
     """
     handler = ARCHIVE_SOURCES.get(source)
@@ -212,10 +215,10 @@ async def add_domain(domain: str, has_paywall: bool, notes: str | None = None) -
 async def remove_paywall_prompt(url: str) -> list[dict]:
     """Use this prompt when you encounter a URL blocked by a paywall or login wall.
 
-    The remove_paywall tool will search internet archives (Wayback Machine,
-    archive.is mirrors, and Wayback Availability API) for an archived copy
-    of the article that bypasses the paywall. Non-paywalled domains are
-    fetched live.
+    The remove_paywall tool tries a direct Googlebot fetch, then 12ft.io proxy,
+    iitty textise, Wayback Machine, archive.is/ph mirrors, and Wayback
+    Availability API for an archived copy that bypasses the paywall.
+    Non-paywalled domains are fetched live.
 
     Archive sources are tried in parallel, with order optimized per-domain
     based on historical success rates.

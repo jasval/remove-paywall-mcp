@@ -10,9 +10,9 @@ TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 CDX_BASE = "https://web.archive.org/cdx/search/cdx"
 ARCHIVE_VIEW = "https://web.archive.org/web/{timestamp}id_/{url}"
 ARCHIVE_IS_MIRRORS = [
+    "https://archive.ph",
     "https://archive.is",
     "https://archive.today",
-    "https://archive.ph",
     "https://archive.md",
 ]
 
@@ -20,6 +20,8 @@ UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+
+GOOGLEBOT_UA = "Googlebot/2.1 (+http://www.google.com/bot.html)"
 
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
@@ -56,6 +58,13 @@ GATEWAY_MARKERS = [
     "unusual traffic",
     "cannot be crawled or displayed due to robots.txt",
     "The Wayback Machine has not archived that URL",
+]
+
+_12FT_FAILURE_MARKERS = [
+    "12ft.io was unable to",
+    "12ft has been disabled",
+    "Error 404",
+    "Something went wrong",
 ]
 
 PAYWALL_MARKERS = [
@@ -235,13 +244,90 @@ async def wayback_available(url: str, client: httpx.AsyncClient | None = None) -
             await client.aclose()
 
 
+async def googlebot(url: str, client: httpx.AsyncClient | None = None) -> ArchiveResult:
+    own_client = client is None
+    if own_client:
+        client = _make_client()
+    try:
+        resp = await client.get(
+            url,
+            headers={"User-Agent": GOOGLEBOT_UA},
+            follow_redirects=True,
+        )
+        size = len(resp.content)
+        if resp.status_code == 200:
+            if size < 500:
+                return ArchiveResult(False, "googlebot", None, None, f"Response too small ({size} bytes)")
+            if size > MAX_RESPONSE_BYTES:
+                return ArchiveResult(False, "googlebot", None, None, f"Response too large ({size} bytes)")
+            if _is_gateway_page(resp.text):
+                return ArchiveResult(False, "googlebot", None, None, "Response was a gateway/challenge page")
+            return ArchiveResult(True, "googlebot", resp.text, str(resp.url), None)
+        if resp.status_code in (401, 403) and size > 10000 and not _is_gateway_page(resp.text):
+            return ArchiveResult(True, "googlebot", resp.text, str(resp.url), None)
+        return ArchiveResult(
+            False, "googlebot", None, None,
+            f"HTTP {resp.status_code}, size {size}",
+        )
+    except Exception as exc:
+        return ArchiveResult(False, "googlebot", None, None, str(exc))
+    finally:
+        if own_client:
+            await client.aclose()
+
+
+async def twelve_ft(url: str, client: httpx.AsyncClient | None = None) -> ArchiveResult:
+    own_client = client is None
+    if own_client:
+        client = _make_client()
+    try:
+        proxy_url = f"https://12ft.io/proxy?q={quote(url, safe='')}"
+        resp = await client.get(proxy_url)
+        if resp.status_code != 200:
+            return ArchiveResult(False, "12ft", None, None, f"HTTP {resp.status_code}")
+        if any(m in resp.text for m in _12FT_FAILURE_MARKERS):
+            return ArchiveResult(False, "12ft", None, None, "12ft.io could not bypass the paywall")
+        if _has_sufficient_content(resp):
+            return ArchiveResult(True, "12ft", resp.text, str(resp.url), None)
+        return ArchiveResult(False, "12ft", None, None, "Insufficient content")
+    except Exception as exc:
+        return ArchiveResult(False, "12ft", None, None, str(exc))
+    finally:
+        if own_client:
+            await client.aclose()
+
+
+async def iitty(url: str, client: httpx.AsyncClient | None = None) -> ArchiveResult:
+    own_client = client is None
+    if own_client:
+        client = _make_client()
+    try:
+        encoded = quote(url, safe="")
+        iitty_url = f"https://textise.iitty.com/{encoded}?iitty=text"
+        resp = await client.get(iitty_url)
+        if _has_sufficient_content(resp):
+            return ArchiveResult(True, "iitty", resp.text, str(resp.url), None)
+        return ArchiveResult(
+            False, "iitty", None, None,
+            f"Insufficient content (status {resp.status_code})",
+        )
+    except Exception as exc:
+        return ArchiveResult(False, "iitty", None, None, str(exc))
+    finally:
+        if own_client:
+            await client.aclose()
+
+
 ARCHIVE_SOURCES: dict[str, object] = {
+    "googlebot": googlebot,
+    "12ft": twelve_ft,
+    "iitty": iitty,
     "wayback": wayback,
     "archive_is": archive_is,
     "wayback_available": wayback_available,
 }
 
-DEFAULT_ARCHIVE_ORDER: list[str] = ["wayback", "archive_is", "wayback_available"]
+DEFAULT_ARCHIVE_ORDER: list[str] = ["googlebot", "12ft", "iitty", "wayback", "archive_is", "wayback_available"]
 
 
 async def search_all(
