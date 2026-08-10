@@ -3,6 +3,7 @@ name = "remove-paywall-mcp"
 version = "1.0.0"
 description = "MCP server that removes article paywalls via internet archives"
 license = "MIT"
+readme = "README.md"
 requires-python = ">=3.11"
 authors = [
     {name = "RemovePaywall"},
