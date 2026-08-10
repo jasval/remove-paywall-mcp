@@ -5,11 +5,13 @@ MCP server that removes article paywalls by searching internet archives. Give it
 ## How it works
 
 1. You give it a paywalled article URL
-2. It searches internet archives (Wayback Machine, archive.is, Google Cache) for an archived copy — archives don't have paywalls because they were crawled without login gates
-3. It extracts the article body with [readability-lxml](https://github.com/buriy/python-readability), stripping navigation, ads, and sidebar cruft
-4. It returns clean text with the title and snapshot URL
+2. Tracking params are stripped and the URL is normalized
+3. It searches internet archives in parallel (Wayback Machine CDX API, archive.is mirrors, Wayback Availability API) for an archived copy — archives don't have paywalls because they were crawled without login gates
+4. It extracts the article body with [readability-lxml](https://github.com/buriy/python-readability), stripping navigation, ads, and sidebar cruft
+5. Post-extraction check: if the result still contains paywall text (e.g., the snapshot captured the paywall itself), it retries with the next archive
+6. It returns clean text with the title and snapshot URL
 
-It also learns from every attempt — success rates per domain per archive source are tracked in a local SQLite database, and archive search order is re-ranked automatically.
+It also learns from every attempt — success rates per domain per archive source are tracked in a local SQLite database, and archive search order is re-ranked automatically using Laplace smoothing.
 
 ## Install
 
@@ -100,7 +102,7 @@ Fetch from a specific archive source.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `url` | string | The article URL |
-| `source` | string | `wayback`, `archive_is`, or `memento` |
+| `source` | string | `wayback`, `archive_is`, or `wayback_available` |
 
 ### `domain_info`
 
@@ -120,6 +122,30 @@ Register a domain in the knowledge base. Mark paywalled domains so archives are 
 | `has_paywall` | boolean | `true` if the site has a paywall |
 | `notes` | string? | Optional description |
 
+## Prompts
+
+The server provides 3 prompt templates for LLMs to use the tools effectively.
+
+### `remove_paywall_prompt`
+
+Full instruct for bypassing a specific URL. Tells the assistant to use `remove_paywall`, fall back to `search_archives`, and check `domain_info`.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `url` | string | The paywalled article URL |
+
+### `bypass_paywall`
+
+Short alias — just tells the assistant to call `remove_paywall` on the URL.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `url` | string | The paywalled article URL |
+
+### `handle_paywalls`
+
+System prompt fragment. No arguments — returns instructions for the assistant to automatically call `remove_paywall` whenever it encounters a paywall, login wall, or metered content. Paste this into your system prompt or load it as a prompt at session start.
+
 ## Domain knowledge base
 
 Seeded with 30 well-known paywalled domains (NYT, WSJ, Bloomberg, Medium, etc.), stored in SQLite at `~/.remove-paywall-mcp/domains.db`. Tracks every archive success/failure per domain and re-ranks archive search order automatically — domains where archive.is consistently fails won't waste time on it.
@@ -137,9 +163,9 @@ Seeded with 30 well-known paywalled domains (NYT, WSJ, Bloomberg, Medium, etc.),
 
 | Source | Priority | Notes |
 |--------|----------|-------|
-| Wayback Machine | 1 | CDX API, newest-first with dedup and HTML-only filtering |
-| archive.is mirrors | 2 | Tries newest/oldest across archive.is, archive.ph, archive.md |
-| Memento Time Travel | 3 | Aggregates ~20 archive APIs including national libraries |
+| Wayback Machine | 1 | CDX API, newest-first (`limit=-5`), dedup via `collapse=digest`, HTML-only |
+| archive.is mirrors | 2 | Tries newest/oldest across archive.is, archive.today, archive.ph, archive.md |
+| Wayback Availability | 3 | `archive.org/wayback/available` — single closest snapshot as fast fallback |
 
 Priority is dynamically re-ranked per domain based on historical success rates recorded in the knowledge base.
 
@@ -151,7 +177,7 @@ MCP client (Claude/OpenCode/LiteLLM)
        ▼
 ┌─────────────────┐
 │    server.py     │  MCPServer with 5 tools
-│  (.tool decorator)│
+│  +3 prompts       │
 └────────┬────────┘
          │
     ┌────┴────┐
@@ -163,7 +189,8 @@ MCP client (Claude/OpenCode/LiteLLM)
 │ wayback│ │readability│
 │ archive│ │Beautiful  │
 │ .is    │ │Soup       │
-│memento │ │           │
+│ wayback│ │           │
+│ avail  │ │           │
 └───┬────┘ └──────────┘
     │
     ▼
