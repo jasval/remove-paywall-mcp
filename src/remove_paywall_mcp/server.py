@@ -80,7 +80,7 @@ async def search_archives(url: str) -> str:
     (Wayback Machine, archive.is, Google Cache, removepaywall.com proxy).
     Does not extract content — use remove_paywall for full article retrieval.
     """
-    archive_order = ["wayback", "archive_is", "google_cache", "removepaywall_com"]
+    archive_order = ["wayback", "archive_is", "google_cache"]
 
     async with httpx.AsyncClient(headers={"User-Agent": UA}, follow_redirects=True) as client:
         lines: list[str] = []

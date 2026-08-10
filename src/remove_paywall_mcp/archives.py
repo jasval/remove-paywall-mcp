@@ -10,7 +10,6 @@ TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 CDX_BASE = "https://web.archive.org/cdx/search/cdx"
 ARCHIVE_VIEW = "https://web.archive.org/web/{timestamp}id_/{url}"
 ARCHIVE_IS_BASE = "https://archive.is"
-REMOVE_PAYWALL_SEARCH = "https://www.removepaywall.com/search"
 GOOGLE_CACHE = "https://webcache.googleusercontent.com/search?q=cache:{url}"
 
 UA = (
@@ -25,9 +24,16 @@ GATEWAY_MARKERS = [
     "<title>502",
     "<title>503",
     "<title>504",
+    "<title>Error 404",
     "Just a moment...</title>",
     "Checking your browser",
     "Please enable cookies",
+    "consent.google",
+    "google.com/webhp",
+    "<title>cache:",
+    "google.com/search</title>",
+    "Please Don't Scroll Past This",
+    "<title>Wayback Machine</title>",
 ]
 
 
@@ -141,33 +147,19 @@ async def removepaywall_com(url: str, client: httpx.AsyncClient | None = None) -
     if own_client:
         client = _make_client()
     try:
-        search_url = f"{REMOVE_PAYWALL_SEARCH}?url={quote(url, safe='')}"
-        resp = await client.get(search_url)
-        if resp.status_code != 200:
-            return ArchiveResult(
-                False, "removepaywall_com", None, None, f"removepaywall.com error: HTTP {resp.status_code}"
-            )
-
-        links = re.findall(r'href="(https?://archive\.(?:is|today|ph)/[^"]+)"', resp.text)
-        if links:
-            for link in links:
-                try:
-                    arc_resp = await client.get(link)
-                    if _valid_page(arc_resp):
-                        return ArchiveResult(True, "removepaywall_com", arc_resp.text, link, None)
-                except Exception:
-                    continue
-
-        wayback_hint = re.search(r'href="(https?://web\.archive\.org/[^"]+)"', resp.text)
-        if wayback_hint:
+        tries = [
+            f"https://archive.is/newest/{quote(url, safe='')}",
+            f"https://archive.is/oldest/{quote(url, safe='')}",
+            f"https://web.archive.org/web/*/{quote(url, safe='')}",
+        ]
+        for try_url in tries:
             try:
-                arc_resp = await client.get(wayback_hint.group(1))
-                if _valid_page(arc_resp):
-                    return ArchiveResult(True, "removepaywall_com", arc_resp.text, wayback_hint.group(1), None)
+                resp = await client.get(try_url)
+                if _valid_page(resp):
+                    return ArchiveResult(True, "removepaywall_com", resp.text, try_url, None)
             except Exception:
-                pass
-
-        return ArchiveResult(False, "removepaywall_com", None, None, "No archive links found on removepaywall.com")
+                continue
+        return ArchiveResult(False, "removepaywall_com", None, None, "No archive snapshot found via removepaywall.com")
     except Exception as e:
         return ArchiveResult(False, "removepaywall_com", None, None, str(e))
     finally:
@@ -182,7 +174,7 @@ ARCHIVE_SOURCES: dict[str, object] = {
     "removepaywall_com": removepaywall_com,
 }
 
-DEFAULT_ARCHIVE_ORDER: list[str] = ["wayback", "archive_is", "google_cache", "removepaywall_com"]
+DEFAULT_ARCHIVE_ORDER: list[str] = ["wayback", "archive_is", "google_cache"]
 
 
 async def search_all(
