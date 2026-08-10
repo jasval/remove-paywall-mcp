@@ -9,7 +9,12 @@ import httpx
 TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 CDX_BASE = "https://web.archive.org/cdx/search/cdx"
 ARCHIVE_VIEW = "https://web.archive.org/web/{timestamp}id_/{url}"
-ARCHIVE_IS_MIRRORS = ["https://archive.is", "https://archive.ph", "https://archive.md"]
+ARCHIVE_IS_MIRRORS = [
+    "https://archive.is",
+    "https://archive.today",
+    "https://archive.ph",
+    "https://archive.md",
+]
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -22,6 +27,7 @@ _TRACKING_PARAMS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "fbclid", "gclid", "gclsrc", "dclid", "msclkid", "twclid",
     "ref", "ref_src", "source", "mc_cid", "mc_eid",
+    "syn", "ito", "tpcc",
 }
 
 GATEWAY_MARKERS = [
@@ -84,7 +90,11 @@ def normalize_url(url: str) -> str:
     parsed = urlparse(url)
     if parsed.query:
         qs = parse_qs(parsed.query, keep_blank_values=True)
-        clean = {k: v for k, v in qs.items() if k.lower() not in _TRACKING_PARAMS}
+        clean = {
+            k: v
+            for k, v in qs.items()
+            if not any(k.lower() == p or k.lower().startswith(p + "-") for p in _TRACKING_PARAMS)
+        }
         parsed = parsed._replace(query=urlencode(clean, doseq=True) if clean else "")
     return urlunparse(parsed._replace(fragment=""))
 
@@ -193,39 +203,33 @@ async def archive_is(url: str, client: httpx.AsyncClient | None = None) -> Archi
             await client.aclose()
 
 
-async def memento(url: str, client: httpx.AsyncClient | None = None) -> ArchiveResult:
+async def wayback_available(url: str, client: httpx.AsyncClient | None = None) -> ArchiveResult:
     own_client = client is None
     if own_client:
         client = _make_client()
     try:
-        api_url = f"https://timetravel.mementoweb.org/api/json/{quote(normalize_url(url), safe='')}"
+        api_url = f"https://archive.org/wayback/available?url={quote(normalize_url(url), safe='')}"
         resp = await client.get(api_url)
         if resp.status_code != 200:
-            return ArchiveResult(False, "memento", None, None, f"Memento API error: {resp.status_code}")
+            return ArchiveResult(False, "wayback_available", None, None, f"Availability API error: {resp.status_code}")
         try:
             data = resp.json()
         except Exception as exc:
-            return ArchiveResult(False, "memento", None, None, f"Memento response not valid JSON: {exc}")
+            return ArchiveResult(False, "wayback_available", None, None, f"Invalid JSON: {exc}")
 
-        mementos = data.get("mementos", {})
-        uris = sorted(
-            [(info.get("uri", ""), info.get("datetime", "")) for info in mementos.get("list", [])],
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        if not uris:
-            return ArchiveResult(False, "memento", None, None, "No mementos found")
-
-        for uri, _dt in uris[:3]:
-            try:
-                arc_resp = await client.get(uri)
-                if _has_sufficient_content(arc_resp):
-                    return ArchiveResult(True, "memento", arc_resp.text, uri, None)
-            except Exception:
-                continue
-        return ArchiveResult(False, "memento", None, None, "Memento snapshots were empty or unreachable")
+        snapshots = data.get("archived_snapshots", {})
+        closest = snapshots.get("closest")
+        if not closest or not closest.get("available"):
+            return ArchiveResult(False, "wayback_available", None, None, "No snapshot available")
+        snapshot_url = closest.get("url", "")
+        if not snapshot_url:
+            return ArchiveResult(False, "wayback_available", None, None, "Snapshot URL missing")
+        arc_resp = await client.get(snapshot_url)
+        if _has_sufficient_content(arc_resp):
+            return ArchiveResult(True, "wayback_available", arc_resp.text, snapshot_url, None)
+        return ArchiveResult(False, "wayback_available", None, None, "Snapshot was empty or unreachable")
     except Exception as exc:
-        return ArchiveResult(False, "memento", None, None, str(exc))
+        return ArchiveResult(False, "wayback_available", None, None, str(exc))
     finally:
         if own_client:
             await client.aclose()
@@ -234,10 +238,10 @@ async def memento(url: str, client: httpx.AsyncClient | None = None) -> ArchiveR
 ARCHIVE_SOURCES: dict[str, object] = {
     "wayback": wayback,
     "archive_is": archive_is,
-    "memento": memento,
+    "wayback_available": wayback_available,
 }
 
-DEFAULT_ARCHIVE_ORDER: list[str] = ["wayback", "archive_is", "memento"]
+DEFAULT_ARCHIVE_ORDER: list[str] = ["wayback", "archive_is", "wayback_available"]
 
 
 async def search_all(
@@ -273,7 +277,9 @@ async def search_all(
                 first_success = result
 
     if first_success is not None:
-        return first_success, sorted(all_results, key=lambda r: archive_order.index(r.source))
+        return first_success, sorted(
+            all_results, key=lambda r: archive_order.index(r.source) if r.source in archive_order else 999
+        )
     return ArchiveResult(False, "none", None, None, "All archive sources exhausted"), sorted(
-        all_results, key=lambda r: archive_order.index(r.source)
+        all_results, key=lambda r: archive_order.index(r.source) if r.source in archive_order else 999
     )

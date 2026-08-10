@@ -104,7 +104,7 @@ async def search_archives(url: str) -> str:
     Wayback Machine, archive.is (multiple mirrors), and Memento Time Travel.
     Does not extract content — use remove_paywall for full article retrieval.
     """
-    archive_order = ["wayback", "archive_is", "memento"]
+    archive_order = ["wayback", "archive_is", "wayback_available"]
 
     async with httpx.AsyncClient(headers={"User-Agent": UA}, follow_redirects=True) as client:
         lines: list[str] = []
@@ -125,7 +125,7 @@ async def search_archives(url: str) -> str:
 async def get_from_archive(url: str, source: str) -> str:
     """Fetch an archived version of a URL from a specific source.
 
-    source must be one of: wayback, archive_is, memento.
+    source must be one of: wayback, archive_is, wayback_available.
     Returns the extracted article text.
     """
     handler = ARCHIVE_SOURCES.get(source)
