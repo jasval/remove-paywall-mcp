@@ -63,7 +63,7 @@ Once installed, add this to your MCP client config:
 
 ```yaml
 mcp_tools:
-  remove-paywall:
+  remove_paywall:
     type: "stdio"
     command: "uvx"
     args: ["remove-paywall-mcp"]
